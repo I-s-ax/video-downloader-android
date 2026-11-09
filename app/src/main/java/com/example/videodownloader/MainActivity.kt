@@ -139,6 +139,13 @@ private suspend fun resolveAndDownload(context: Context, initialUrl: String): Lo
     withContext(Dispatchers.IO) {
         val userAgent = "Mozilla/5.0 (Linux; Android 13; SM-S908B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36"
         var finalUrl = initialUrl
+        // Cookies de sesión que TikTok envía durante las redirecciones: se
+        // capturan en cada salto y se reenvían en el siguiente y en la
+        // descarga final. La identidad (User-Agent) debe ser la misma que
+        // usa el Worker al consultar la API (ver tiktok.ts).
+        val cookies = mutableMapOf<String, String>()
+        fun cookieHeader(): String =
+            cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
         try {
             var current = initialUrl
             var hops = 0
@@ -149,8 +156,16 @@ private suspend fun resolveAndDownload(context: Context, initialUrl: String): Lo
                 connection.readTimeout = 10000
                 connection.setRequestProperty("User-Agent", userAgent)
                 connection.setRequestProperty("Referer", "https://www.tiktok.com/")
+                if (cookies.isNotEmpty()) connection.setRequestProperty("Cookie", cookieHeader())
                 try {
                     connection.connect()
+                    // Capturar todas las cookies de esta respuesta.
+                    connection.headerFields["Set-Cookie"]?.forEach { raw ->
+                        val pair = raw.substringBefore(";").trim()
+                        val name = pair.substringBefore("=").trim()
+                        val value = pair.substringAfter("=", "")
+                        if (name.isNotBlank()) cookies[name] = value
+                    }
                     val redirect = connection.getHeaderField("Location")
                     if (connection.responseCode in 300..399 && !redirect.isNullOrBlank()) {
                         current = URL(URL(current), redirect).toString()
@@ -179,6 +194,7 @@ private suspend fun resolveAndDownload(context: Context, initialUrl: String): Lo
             // La CDN de TikTok rechaza (403) las peticiones sin encabezados de navegador.
             .addRequestHeader("User-Agent", userAgent)
             .addRequestHeader("Referer", "https://www.tiktok.com/")
+        if (cookies.isNotEmpty()) request.addRequestHeader("Cookie", cookieHeader())
         val manager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
         manager.enqueue(request)
     }
