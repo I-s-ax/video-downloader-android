@@ -16,6 +16,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
 import org.json.JSONObject
@@ -100,7 +101,13 @@ private fun AppScreen() {
                     // Cuando el extractor esté conectado, procesar aquí formats[0].download_url.
                     val downloadUrl = result.optJSONArray("formats")
                         ?.optJSONObject(0)?.optString("download_url").orEmpty()
-                    if (downloadUrl.isNotBlank()) enqueueDownload(context, downloadUrl)
+                    if (downloadUrl.isNotBlank()) {
+                        val downloadId = enqueueDownload(context, downloadUrl)
+                        status = "Descarga en cola, verificando..."
+                        kotlinx.coroutines.MainScope().launch {
+                            watchDownload(context, downloadId) { status = it }
+                        }
+                    }
                 } catch (e: Exception) { status = "Error: ${e.message}" }
                 busy = false
             }
@@ -115,7 +122,7 @@ private fun AppScreen() {
     }
 }
 
-private fun enqueueDownload(context: Context, downloadUrl: String) {
+private fun enqueueDownload(context: Context, downloadUrl: String): Long {
     val uri = Uri.parse(downloadUrl)
     require(uri.scheme == "https") { "La descarga debe usar HTTPS" }
     val request = DownloadManager.Request(uri)
@@ -129,5 +136,35 @@ private fun enqueueDownload(context: Context, downloadUrl: String) {
         .addRequestHeader("User-Agent", "Mozilla/5.0 (Linux; Android 13; SM-S908B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36")
         .addRequestHeader("Referer", "https://www.tiktok.com/")
     val manager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-    manager.enqueue(request)
+    return manager.enqueue(request)
+}
+
+// Consulta el estado real de la descarga para saber el motivo exacto del
+// fallo (por ejemplo, el código HTTP de la CDN) en lugar de adivinarlo.
+private suspend fun watchDownload(context: Context, downloadId: Long, onUpdate: (String) -> Unit) {
+    val manager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+    repeat(30) {
+        delay(2000)
+        val cursor = manager.query(DownloadManager.Query().setFilterById(downloadId))
+        cursor.use {
+            if (it.moveToFirst()) {
+                val downloadStatus = it.getInt(it.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+                val reason = it.getInt(it.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON))
+                when (downloadStatus) {
+                    DownloadManager.STATUS_SUCCESSFUL -> {
+                        onUpdate("Descarga completada. Revisa la carpeta Descargas.")
+                        return
+                    }
+                    DownloadManager.STATUS_FAILED -> {
+                        val http = if (reason >= 400) " (código HTTP de la CDN)" else ""
+                        onUpdate("Descarga fallida. Estado: $downloadStatus, motivo: $reason$http.")
+                        return
+                    }
+                    DownloadManager.STATUS_RUNNING -> onUpdate("Descargando video...")
+                    DownloadManager.STATUS_PAUSED -> onUpdate("Descarga en pausa. Motivo: $reason.")
+                }
+            }
+        }
+    }
+    onUpdate("La descarga sigue en curso después de 60 s. Revisa la notificación de Descargas.")
 }
