@@ -15,7 +15,7 @@ android {
         versionCode = 1
         versionName = "0.1.0"
         // Reemplaza por la URL HTTPS real de tu Worker.
-        buildConfigField("String", "API_BASE_URL", "\"https://REPLACE_WITH_WORKER.workers.dev\"")
+        buildConfigField("String", "API_BASE_URL", "\"https://video-api-cloudflare.ipromotor03.workers.dev\"")
     }
 
     buildFeatures {
