@@ -125,6 +125,9 @@ private fun enqueueDownload(context: Context, downloadUrl: String) {
         .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "video_${System.currentTimeMillis()}.mp4")
         .setAllowedOverMetered(true)
         .setAllowedOverRoaming(false)
+        // La CDN de TikTok rechaza (403) las peticiones sin encabezados de navegador.
+        .addRequestHeader("User-Agent", "Mozilla/5.0 (Linux; Android 13; SM-S908B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36")
+        .addRequestHeader("Referer", "https://www.tiktok.com/")
     val manager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
     manager.enqueue(request)
 }
