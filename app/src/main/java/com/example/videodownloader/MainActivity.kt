@@ -23,6 +23,12 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 
+// User-Agent único para todo TikTok: la app, la API Aweme y el Worker usan
+// exactamente este. TikTok asocia la URL firmada a esta identidad y la CDN
+// rechaza la descarga (403) si cambia entre la consulta y la descarga.
+private const val TIKTOK_USER_AGENT =
+    "Mozilla/5.0 (Linux; Android 13; SM-S908B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36"
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -96,11 +102,17 @@ private fun AppScreen() {
             busy = true
             kotlinx.coroutines.MainScope().launch {
                 try {
-                    val result = request("/api/v1/extract", JSONObject().put("url", link), token)
-                    status = result.optString("message", result.optString("error", "Respuesta recibida"))
-                    // Cuando el extractor esté conectado, procesar aquí formats[0].download_url.
-                    val downloadUrl = result.optJSONArray("formats")
-                        ?.optJSONObject(0)?.optString("download_url").orEmpty()
+                    // 1. Extracción nativa en el teléfono (sin backend). Si
+                    // falla, respaldo: extracción por el Worker como antes.
+                    status = "Extrayendo en el teléfono..."
+                    val downloadUrl = try {
+                        extractTikTokNativeUrl(link)
+                    } catch (e: Exception) {
+                        status = "La extracción en el teléfono falló (${e.message}). Probando con el servidor..."
+                        val result = request("/api/v1/extract", JSONObject().put("url", link), token)
+                        result.optJSONArray("formats")
+                            ?.optJSONObject(0)?.optString("download_url").orEmpty()
+                    }
                     if (downloadUrl.isNotBlank()) {
                         status = "Resolviendo enlace en el teléfono..."
                         val downloadId = resolveAndDownload(context, downloadUrl)
@@ -108,6 +120,8 @@ private fun AppScreen() {
                         kotlinx.coroutines.MainScope().launch {
                             watchDownload(context, downloadId) { status = it }
                         }
+                    } else {
+                        status = "No se pudo obtener el enlace del video."
                     }
                 } catch (e: Exception) { status = "Error: ${e.message}" }
                 busy = false
@@ -123,6 +137,112 @@ private fun AppScreen() {
     }
 }
 
+// Extracción nativa de TikTok en el teléfono, sin backend (como hace
+// MultiDownloads según el PCAP: vm.tiktok.com -> www.tiktok.com ->
+// API Aweme -> CDN v19). Al extraer desde el mismo móvil que descarga:
+//  * TikTok firma la URL para la IP del teléfono (no hay 403 por IP).
+//  * Las cookies de la sesión se retienen de forma nativa.
+//  * No hay discordancia de User-Agent: todo usa TIKTOK_USER_AGENT.
+// El inicio de sesión sigue pasando por el Worker de Cloudflare; solo el
+// motor de extracción corre en el teléfono. Devuelve la URL directa del
+// video (play_addr, con https forzado). Lanza Exception si no la obtiene.
+private suspend fun extractTikTokNativeUrl(link: String): String =
+    withContext(Dispatchers.IO) {
+        // 1. Resolver el enlace corto siguiendo las redirecciones a mano
+        // (como resolveAndDownload) y capturando las cookies de sesión.
+        var finalUrl = link
+        val cookies = mutableMapOf<String, String>()
+        fun cookieHeader(): String =
+            cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+        var current = link
+        var hops = 0
+        while (hops < 5) {
+            val connection = URL(current).openConnection() as HttpURLConnection
+            connection.instanceFollowRedirects = false
+            connection.connectTimeout = 10000
+            connection.readTimeout = 10000
+            connection.setRequestProperty("User-Agent", TIKTOK_USER_AGENT)
+            connection.setRequestProperty("Referer", "https://www.tiktok.com/")
+            if (cookies.isNotEmpty()) connection.setRequestProperty("Cookie", cookieHeader())
+            try {
+                connection.connect()
+                connection.headerFields["Set-Cookie"]?.forEach { raw ->
+                    val pair = raw.substringBefore(";").trim()
+                    val name = pair.substringBefore("=").trim()
+                    val value = pair.substringAfter("=", "")
+                    if (name.isNotBlank()) cookies[name] = value
+                }
+                val redirect = connection.getHeaderField("Location")
+                if (connection.responseCode in 300..399 && !redirect.isNullOrBlank()) {
+                    current = URL(URL(current), redirect).toString()
+                    finalUrl = current
+                    hops++
+                } else {
+                    break
+                }
+            } finally {
+                connection.disconnect()
+            }
+        }
+
+        // 2. Extraer el ID del video de la URL final.
+        val videoId = Regex("video/(\\d+)").find(finalUrl)?.groupValues?.get(1)
+            ?: throw Exception("No se pudo obtener el ID del video")
+
+        // 3. Consultar la API Aweme DIRECTAMENTE DESDE EL MÓVIL, con
+        // reintento en 3 hosts (igual que el Worker). Así TikTok firma el
+        // video para la IP actual del teléfono.
+        val hosts = listOf(
+            "api16-normal-c-useast1a.tiktokv.com",
+            "api19-normal-c-useast1a.tiktokv.com",
+            "api22-normal-c-useast1a.tiktokv.com",
+        )
+        var lastError = "Video no encontrado"
+        for (host in hosts) {
+            try {
+                val apiConn = URL("https://$host/aweme/v1/feed/?aweme_id=$videoId").openConnection() as HttpURLConnection
+                apiConn.connectTimeout = 10000
+                apiConn.readTimeout = 10000
+                apiConn.setRequestProperty("User-Agent", TIKTOK_USER_AGENT)
+                if (cookies.isNotEmpty()) apiConn.setRequestProperty("Cookie", cookieHeader())
+                try {
+                    if (apiConn.responseCode !in 200..299) {
+                        lastError = "TikTok respondió ${apiConn.responseCode}"
+                        delay(1500)
+                        continue
+                    }
+                    val json = JSONObject(apiConn.inputStream.bufferedReader().use { it.readText() })
+                    val awemeList = json.optJSONArray("aweme_list")
+                    if (awemeList == null || awemeList.length() == 0) {
+                        lastError = "Video no encontrado"
+                        continue
+                    }
+                    val video = awemeList.getJSONObject(0).optJSONObject("video")
+                    if (video == null) {
+                        lastError = "Video no encontrado"
+                        continue
+                    }
+                    val urlList = video.optJSONObject("play_addr")?.optJSONArray("url_list")
+                    if (urlList == null || urlList.length() == 0) {
+                        lastError = "Video no encontrado"
+                        continue
+                    }
+                    var playAddr = urlList.getString(0)
+                    if (playAddr.startsWith("http://")) {
+                        playAddr = "https://" + playAddr.removePrefix("http://")
+                    }
+                    return@withContext playAddr
+                } finally {
+                    apiConn.disconnect()
+                }
+            } catch (e: Exception) {
+                lastError = e.message ?: "Error de red"
+                delay(1500)
+            }
+        }
+        throw Exception(lastError)
+    }
+
 // Resuelve la redirección (301/302/...) de la URL de TikTok usando la
 // conexión del propio teléfono y luego encola la descarga con la URL final.
 // Esto es necesario por dos motivos:
@@ -137,7 +257,7 @@ private fun AppScreen() {
 // original como respaldo. Devuelve el id de la descarga en cola.
 private suspend fun resolveAndDownload(context: Context, initialUrl: String): Long =
     withContext(Dispatchers.IO) {
-        val userAgent = "Mozilla/5.0 (Linux; Android 13; SM-S908B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36"
+        val userAgent = TIKTOK_USER_AGENT
         var finalUrl = initialUrl
         // Cookies de sesión que TikTok envía durante las redirecciones: se
         // capturan en cada salto y se reenvían en el siguiente y en la
